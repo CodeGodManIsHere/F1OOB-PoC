@@ -1,0 +1,6 @@
+.theos/
+*.ipa
+*.p12
+*.mobileprovision
+*.zip
+.DS_Store
