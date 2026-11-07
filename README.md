@@ -184,7 +184,24 @@ Targets include the TTBAT guess `0x13400000000` (from `ttbat-phys-addr-base << 1
 and the firmware range. If a target is mapped, the PoC can read/write it; a fault
 stops the loop.
 
-### 5.3. Fresh PoC runs (current device state)
+### 5.3. Pre-touch requirement
+
+The F1 access at `victim.gpuAddress - f1.gpuAddress` only reaches the victim if
+the victim's pages are already present in the GPU context page table. The PoC
+therefore first writes to the victim through its **own** GPU VA:
+
+```
+[METAL] VICTIM own-va write status=4 victim[0]=0x47474747 expect=0x47474747
+[METAL] WRITE idx=... marker=0x43434343
+[METAL] VICTIM[0]=0x43434343
+[METAL] *** CROSS-OBJECT GPU OOB WRITE CONFIRMED ***
+```
+
+Without this pre-touch, the F1 access can be silently dropped and read back as 0
+(see `F1OOB_ANALYSIS.md` §17.2). The PoC also probes `AGXAcceleratorG14P`
+(A15) and `AGXAcceleratorG18P` (A19 Pro).
+
+### 5.4. Fresh PoC runs (current device state)
 
 With 15 filler buffers the victim lands at `+0x180000`:
 
