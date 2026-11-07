@@ -169,7 +169,22 @@ Documents/F1OOB-PoC/run-YYYYMMDD-HHMMSS.log
 A write through the F1 buffer at `+0x100000` changes the contents of a separate
 `MTLBuffer`.
 
-### 5.2. Fresh PoC runs (current device state)
+### 5.2. High-VA probe
+
+The shader buffer argument is a raw 64-bit GPU VA, so the PoC can also test
+whether TTBAT/firmware VAs are mapped in the app's GPU context:
+
+```
+[HIGHVA] target=0x1500001000 delta=... value=...
+[HIGHVA] target=0x13400000000 ...
+[HIGHVA] FAULT target=... err=...
+```
+
+Targets include the TTBAT guess `0x13400000000` (from `ttbat-phys-addr-base << 14`)
+and the firmware range. If a target is mapped, the PoC can read/write it; a fault
+stops the loop.
+
+### 5.3. Fresh PoC runs (current device state)
 
 With 15 filler buffers the victim lands at `+0x180000`:
 

