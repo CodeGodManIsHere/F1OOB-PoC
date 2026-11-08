@@ -1,31 +1,104 @@
 
-name: Verify iOS Project
+name: Build Sample IPA
 
 on:
   workflow_dispatch:
 
 jobs:
-  verify:
+  build:
     runs-on: macos-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check project files
+      - name: Create sample iOS app
         run: |
-          test -f Makefile
-          test -f Info.plist
-          test -f main.m
-          plutil -lint Info.plist
+          mkdir -p Payload/HelloPhone.app
 
-      - name: Package source
+          cat > main.m <<'EOF'
+          #import <UIKit/UIKit.h>
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @end
+
+          @implementation AppDelegate
+          - (BOOL)application:(UIApplication *)application
+            didFinishLaunchingWithOptions:(NSDictionary *)options {
+              self.window = [[UIWindow alloc]
+                initWithFrame:[UIScreen mainScreen].bounds];
+
+              UIViewController *vc = [UIViewController new];
+              vc.view.backgroundColor = [UIColor systemBackgroundColor];
+
+              UILabel *label = [[UILabel alloc] initWithFrame:vc.view.bounds];
+              label.text = @"Hello iPhone!";
+              label.textAlignment = NSTextAlignmentCenter;
+              label.autoresizingMask =
+                UIViewAutoresizingFlexibleWidth |
+                UIViewAutoresizingFlexibleHeight;
+
+              [vc.view addSubview:label];
+              self.window.rootViewController = vc;
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+          @end
+
+          int main(int argc, char *argv[]) {
+            @autoreleasepool {
+              return UIApplicationMain(argc, argv, nil,
+                NSStringFromClass([AppDelegate class]));
+            }
+          }
+          EOF
+
+          cat > Payload/HelloPhone.app/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>HelloPhone</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.example.hellophone</string>
+            <key>CFBundleName</key>
+            <string>HelloPhone</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0</string>
+            <key>LSRequiresIPhoneOS</key>
+            <true/>
+            <key>UILaunchStoryboardName</key>
+            <string></string>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Compile for iPhone
         run: |
-          zip -r project-source.zip \
-            Makefile Info.plist main.m \
-            entitlements.plist README.md
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -framework UIKit \
+            -framework Foundation \
+            main.m \
+            -o Payload/HelloPhone.app/HelloPhone
 
-      - name: Upload artifact
+      - name: Package IPA
+        run: |
+          zip -r HelloPhone.ipa Payload
+
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: project-source
-          path: project-source.zip
+          name: HelloPhone-IPA
+          path: HelloPhone.ipa
